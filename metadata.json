@@ -1,0 +1,6 @@
+{
+  "name": "Apex Confluence",
+  "description": "Free, unrestricted AI-powered trading analysis, custom indicator & strategy studio, backtesting/replay, and multi-school charting platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
