@@ -489,1034 +489,186 @@ export default function App() {
     })();
   }, [symbol, authHeaders]);
 
-  // Real-Time WebSocket listener
+// Real-Time Live Feed (Binance WS for Crypto + OANDA Live Polling for Gold/Forex/Oil)
   useEffect(() => {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let disposed = false;
+    const key = `${symbol}:${timeframe}`;
+    const tfSec = getTimeframeSeconds(timeframe);
+    const cleanSym = symbol.replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+    const isCrypto =
+      cleanSym.endsWith('usdt') || cleanSym.endsWith('busd') || cleanSym.endsWith('usdc');
 
-    const connect = () => {
-      if (disposed) return;
-      try {
-        ws = new WebSocket(`${proto}//${window.location.host}/ws`);
-      } catch {
-        reconnectTimer = setTimeout(connect, 4000);
-        return;
-      }
-      ws.onmessage = (evt) => {
+    const binanceIntervalMap: Record<Timeframe, string> = {
+      '1m': '1m',
+      '5m': '5m',
+      '15m': '15m',
+      '30m': '30m',
+      '1h': '1h',
+      '4h': '4h',
+      '1d': '1d',
+    };
+
+    if (isCrypto) {
+      let ws: WebSocket | null = null;
+      let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+      let closed = false;
+
+      const connectBinance = () => {
+        if (closed) return;
         try {
-          const msg = JSON.parse(evt.data) as { type: string; payload: unknown };
-          if (msg.type === 'quotes') {
-            setQuotes(msg.payload as Record<string, LiveQuote>);
-          } else if (msg.type === 'tick') {
-            const { quote, latestCandles } = msg.payload as {
-              quote: LiveQuote;
-              latestCandles: Partial<Record<Timeframe, Candle>>;
-            };
-            setQuotes((prev) => ({ ...prev, [quote.symbol]: quote }));
-            if (latestCandles) {
-              setCandlesByKey((prev) => {
-                let changed = false;
-                const next = { ...prev };
-                for (const [tfKey, bar] of Object.entries(latestCandles)) {
-                  if (!bar) continue;
-                  const k = `${quote.symbol}:${tfKey}`;
-                  const arr = next[k];
-                  if (!arr || arr.length === 0) continue;
-                  const copy = arr.slice();
-                  const last = copy[copy.length - 1];
-                  if (last.time === bar.time) {
-                    copy[copy.length - 1] = bar;
-                  } else if (bar.time > last.time) {
-                    copy.push(bar);
-                  }
-                  next[k] = copy;
-                  changed = true;
-                }
-                return changed ? next : prev;
-              });
-            }
-          } else if (msg.type === 'signal_new' || msg.type === 'signal_update') {
-            const sig = msg.payload as AISignal;
-            setSignals((prev) => {
-              const idx = prev.findIndex((s) => s.id === sig.id);
-              if (idx >= 0) {
-                const copy = prev.slice();
-                copy[idx] = sig;
-                return copy;
-              }
-              return [sig, ...prev];
-            });
-          } else if (msg.type === 'trade_update') {
-            const tr = msg.payload as UserTrade;
-            setTrades((prev) => {
-              const idx = prev.findIndex((x) => x.id === tr.id);
-              if (idx >= 0) {
-                const copy = prev.slice();
-                copy[idx] = tr;
-                return copy;
-              }
-              return prev;
-            });
-          } else if (msg.type === 'rejected_update') {
-            const rej = msg.payload as RejectedSetup;
-            setRejected((prev) => {
-              const idx = prev.findIndex((x) => x.id === rej.id);
-              if (idx >= 0) {
-                const copy = prev.slice();
-                copy[idx] = rej;
-                return copy;
-              }
-              return [rej, ...prev].slice(0, 100);
-            });
-          } else if (msg.type === 'root_causes_update') {
-            setRootCauseAnalytics(msg.payload as RootCauseAnalytics);
-          } else if (msg.type === 'alert') {
-            const al = msg.payload as AlertEvent;
-            setAlerts((prev) => [al, ...prev].slice(0, 60));
-            setActiveToastAlert(al);
-            if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-            toastTimerRef.current = setTimeout(() => {
-              setActiveToastAlert((curr) => (curr?.id === al.id ? null : curr));
-            }, 9000);
-            if (!alertsMutedRef.current) {
-              playAlertBeep();
-              if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-                const notifData = {
-                  alertId: al.id,
-                  signalId: al.signalId,
-                  tradeId: al.tradeId,
-                  symbol: al.symbol,
-                };
-                if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-                  navigator.serviceWorker.ready
-                    .then((reg) =>
-                      reg.showNotification(al.title, {
-                        body: al.message,
-                        tag: al.id,
-                        data: notifData,
-                      })
-                    )
-                    .catch(() => {});
-                } else {
-                  try {
-                    const n = new Notification(al.title, {
-                      body: al.message,
-                      tag: al.id,
-                      data: notifData,
-                    });
-                    n.onclick = () => {
-                      window.focus();
-                      openAlertTradeCard({ alert: al, ...notifData });
-                      n.close();
-                    };
-                  } catch {
-                    // ignore Notification constructor restriction
-                  }
-                }
-              }
-            }
-          }
-        } catch {
-          // ignore malformed ws message
-        }
-      };
-      ws.onerror = () => {
-        ws?.close();
-      };
-      ws.onclose = () => {
-        if (!disposed) {
-          reconnectTimer = setTimeout(connect, 4000);
-        }
-      };
-    };
-    connect();
-
-    // Periodic health refresh
-    const healthId = setInterval(async () => {
-      try {
-        const res = await fetch('/api/market/health');
-        if (res.ok) {
-          const d = await res.json();
-          setHealth(d.health);
-        }
-      } catch {
-        // ignore
-      }
-    }, 15000);
-
-    return () => {
-      disposed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      clearInterval(healthId);
-      ws?.close();
-    };
-  }, []);
-
-  // Handlers
-  const toggleSchool = (sid: SchoolId) => {
-    setActiveSchools((prev) => (prev.includes(sid) ? prev.filter((x) => x !== sid) : [...prev, sid]));
-  };
-
-  const handleAddDrawing = async (d: DrawingObject) => {
-    setDrawings((prev) => [...prev, d]);
-    setRedoStack([]);
-    await fetch('/api/drawings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify(d),
-    }).catch(() => {});
-  };
-
-  const handleUpdateDrawing = async (d: DrawingObject, persist = true) => {
-    setDrawings((prev) => prev.map((item) => (item.id === d.id ? d : item)));
-    if (persist) {
-      await fetch('/api/drawings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify(d),
-      }).catch(() => {});
-    }
-  };
-
-  const handleDeleteDrawing = async (id: string) => {
-    const target = drawings.find((d) => d.id === id);
-    if (target) setRedoStack((prev) => [...prev, target]);
-    setDrawings((prev) => prev.filter((d) => d.id !== id));
-    await fetch(`/api/drawings/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      headers: authHeaders,
-    }).catch(() => {});
-  };
-
-  const handleToggleLockDrawing = async (id: string) => {
-    const updated = drawings.map((d) => (d.id === id ? { ...d, locked: !d.locked } : d));
-    setDrawings(updated);
-    const target = updated.find((d) => d.id === id);
-    if (target) {
-      await fetch('/api/drawings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify(target),
-      }).catch(() => {});
-    }
-  };
-
-  const handleToggleHideDrawing = async (id: string) => {
-    const updated = drawings.map((d) => (d.id === id ? { ...d, hidden: !d.hidden } : d));
-    setDrawings(updated);
-    const target = updated.find((d) => d.id === id);
-    if (target) {
-      await fetch('/api/drawings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify(target),
-      }).catch(() => {});
-    }
-  };
-
-  const handleUndo = () => {
-    if (drawings.length === 0) return;
-    const last = drawings[drawings.length - 1];
-    void handleDeleteDrawing(last.id);
-  };
-
-  const handleRedo = () => {
-    if (redoStack.length === 0) return;
-    const last = redoStack[redoStack.length - 1];
-    setRedoStack((prev) => prev.slice(0, -1));
-    void handleAddDrawing(last);
-  };
-
-  const handleSaveTemplate = async (name: string) => {
-    const tpl: ChartTemplate = {
-      id: `tpl_${Date.now()}`,
-      name,
-      symbol,
-      timeframe,
-      chartStyle,
-      analysisMode,
-      activeSchools,
-      comparisonSymbol,
-      splitLayout,
-      createdAt: Date.now(),
-    };
-    const res = await fetch('/api/templates', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify(tpl),
-    });
-    if (res.ok) {
-      const d = await res.json();
-      setTemplates(d.templates || []);
-    }
-  };
-
-  const handleApplyTemplate = (tpl: ChartTemplate) => {
-    setSymbol(tpl.symbol);
-    setTimeframe(tpl.timeframe);
-    setChartStyle(tpl.chartStyle);
-    setAnalysisMode(tpl.analysisMode);
-    setActiveSchools(tpl.activeSchools);
-    setComparisonSymbol(tpl.comparisonSymbol);
-    setSplitLayout(tpl.splitLayout);
-  };
-
-  const handleUpdateWatchlist = async (items: WatchlistItem[]) => {
-    setWatchlist(items);
-    await fetch('/api/watchlist', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ items }),
-    }).catch(() => {});
-  };
-
-  const handleExecuteOrder = async (order: {
-    symbol: string;
-    side: 'BUY' | 'SELL';
-    orderType: 'MARKET' | 'LIMIT' | 'STOP';
-    lotSize: number;
-    entryPrice: number;
-    stopLoss: number;
-    takeProfit: number;
-    signalId?: string;
-  }) => {
-    const res = await fetch('/api/trades', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify(order),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Order failed');
-    setTrades((prev) => [data.trade, ...prev]);
-  };
-
-  const handleCloseTrade = async (tradeId: string, exitPrice: number) => {
-    const res = await fetch(`/api/trades/${encodeURIComponent(tradeId)}/close`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ exitPrice }),
-    });
-    if (res.ok) {
-      const d = await res.json();
-      setTrades(d.trades || []);
-    }
-  };
-
-  const handleSaveReflection = async (tradeId: string, tags: string[], notes: string) => {
-    const res = await fetch(`/api/trades/${encodeURIComponent(tradeId)}/reflect`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ tags, notes }),
-    });
-    if (res.ok) {
-      const d = await res.json();
-      setTrades(d.trades || []);
-    }
-  };
-
-  const handleCreateOrUpdateIndicator = async (ind: CustomIndicator) => {
-    const res = await fetch(`/api/indicators/${encodeURIComponent(ind.id)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify(ind),
-    });
-    if (res.ok) {
-      const d = await res.json();
-      setCustomIndicators((prev) => {
-        const idx = prev.findIndex((i) => i.id === d.indicator.id);
-        if (idx >= 0) {
-          const copy = prev.slice();
-          copy[idx] = d.indicator;
-          return copy;
-        }
-        return [d.indicator, ...prev];
-      });
-    }
-  };
-
-  const handleDeleteIndicator = async (id: string) => {
-    setCustomIndicators((prev) => prev.filter((i) => i.id !== id));
-    await fetch(`/api/indicators/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-      headers: authHeaders,
-    }).catch(() => {});
-  };
-
-  const handleToggleIndicatorVisibility = async (id: string) => {
-    const target = customIndicators.find((i) => i.id === id);
-    if (!target) return;
-    await handleCreateOrUpdateIndicator({ ...target, visible: !target.visible });
-  };
-
-  const setLang = useCallback(
-    (nextLang: AppLanguage) => {
-      setLangState(nextLang);
-      try {
-        localStorage.setItem('apex_lang', nextLang);
-      } catch {
-        // ignore storage restrictions
-      }
-      void fetch('/api/auth/profile', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify({ language: nextLang }),
-      })
-        .then(async (res) => {
-          if (res.ok) {
-            const d = await res.json();
-            if (d.user) setUser(d.user);
-          }
-        })
-        .catch(() => {});
-    },
-    [authHeaders]
-  );
-
-  useEffect(() => {
-    document.documentElement.lang = lang;
-  }, [lang]);
-
-  const i18nValue = useMemo(
-    () => ({
-      lang,
-      dir: (lang === 'ar' ? 'rtl' : 'ltr') as 'rtl' | 'ltr',
-      setLang,
-      t: (en: string, ar: string) => pickLang(lang, en, ar),
-    }),
-    [lang, setLang]
-  );
-
-  const handleSaveProfile = async (updates: Partial<UserAccount>) => {
-    if (updates.timezone) setTimezone(updates.timezone);
-    if (updates.language) {
-      setLangState(updates.language);
-      try {
-        localStorage.setItem('apex_lang', updates.language);
-      } catch {
-        // ignore
-      }
-    }
-    const res = await fetch('/api/auth/profile', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify(updates),
-    });
-    if (res.ok) {
-      const d = await res.json();
-      setUser(d.user);
-    }
-  };
-
-  const handleSaveDefaultPreset = async () => {
-    await fetch('/api/preset', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ symbol, timeframe, activeSchools, analysisMode, language: lang }),
-    });
-  };
-
-  const handleEnablePush = async (): Promise<string> => {
-    if (typeof Notification === 'undefined') {
-      return pickLang(lang, 'Browser notifications are not supported on this device.', 'إشعارات المتصفح غير مدعومة على هذا الجهاز.');
-    }
-    const perm = await Notification.requestPermission();
-    if (perm === 'granted') {
-      await fetch('/api/push/subscribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
-        body: JSON.stringify({ grantedAt: Date.now() }),
-      }).catch(() => {});
-      return pickLang(lang, 'Push notifications enabled for signals, TP1->BE, and scalp guards.', 'تم تفعيل إشعارات المتصفح للإشارات وتحريك الوقف والاسكالبينج.');
-    }
-    return `${pickLang(lang, 'Notification permission status', 'حالة إذن الإشعارات')}: ${perm}`;
-  };
-
-  const handleInspectSignal = (sig: AISignal) => {
-    setInspectedSignal(sig);
-    setSymbol(sig.symbol);
-    setTimeframe(sig.recommendedTimeframe);
-    setAnalysisMode('ai');
-    setActivePage('chart');
-  };
-
-  const handleSyncBacktestRun = useCallback((runKey: string, setups: BacktestTrade[]) => {
-    setBtSetupsByKey((prev) => {
-      const existing = prev[runKey];
-      if (
-        existing &&
-        existing.length === setups.length &&
-        existing.every(
-          (e, idx) =>
-            e.id === setups[idx].id &&
-            e.status === setups[idx].status &&
-            e.tp1Hit === setups[idx].tp1Hit &&
-            e.pnlR === setups[idx].pnlR
-        )
-      ) {
-        return prev;
-      }
-      return { ...prev, [runKey]: setups };
-    });
-  }, []);
-
-  const allBacktestSetups = useMemo(
-    () => Object.values(btSetupsByKey).flat().sort((a, b) => b.entryTime - a.entryTime),
-    [btSetupsByKey]
-  );
-
-  const handleJumpToBacktestSetup = useCallback((setup: BacktestTrade) => {
-    btJumpSeqRef.current += 1;
-    setBtJumpRequest({
-      symbol: setup.symbol,
-      timeframe: setup.timeframe,
-      barIndex: setup.barIndex,
-      entryTime: setup.entryTime,
-      setupId: setup.id,
-      seq: btJumpSeqRef.current,
-    });
-    setActivePage('backtest');
-  }, []);
-
-  const handleJumpFromTradeModal = useCallback(
-    (payload: InspectedTradePayload) => {
-      setInspectedTradeModal(null);
-      if (payload.kind === 'signal') {
-        handleInspectSignal(payload.signal);
-        return;
-      }
-      if (payload.kind === 'user') {
-        setSymbol(payload.trade.symbol);
-        setActivePage('chart');
-        return;
-      }
-      if (payload.kind === 'backtest') {
-        handleJumpToBacktestSetup(payload.setup);
-        return;
-      }
-      if (payload.alert.symbol) {
-        setSymbol(payload.alert.symbol);
-        setActivePage('chart');
-      }
-    },
-    [handleJumpToBacktestSetup]
-  );
-
-  const unreadAlerts = alerts.filter((a) => !a.read).length;
-  const activeSignalsCount = signals.filter((s) => s.status === 'Active' || s.status === 'Breakeven').length;
-  const { t, dir } = i18nValue;
-
-  return (
-    <I18nContext.Provider value={i18nValue}>
-    <div dir={dir} className="min-h-dvh bg-white text-black flex flex-col pb-14 md:pb-0">
-      {/* Top Status Strip & Navigation */}
-      <header className="sticky top-0 z-30 h-13 bg-white/95 backdrop-blur-xs border-b border-neutral-200 px-3 sm:px-5 flex items-center justify-between gap-2 sm:gap-4">
-        <div className="flex items-center gap-2.5 sm:gap-3 shrink-0" dir="ltr">
-          <button
-            type="button"
-            onClick={() => setActivePage('chart')}
-            className="text-left focus:outline-none"
-          >
-            <Logo />
-          </button>
-
-          {/* Live 24/7 Engine & Feed Health indicator dot (real live telemetry) */}
-          <button
-            type="button"
-            onClick={() => setActivePage('settings')}
-            title={t('24/7 Engine & Feed Health', 'حالة المحرك والتغذية المباشرة 24/7')}
-            className="hidden sm:inline-flex items-center gap-1.5 text-[11px] font-medium text-neutral-600 hover:text-black"
-          >
-            <span
-              className={`w-2 h-2 rounded-full ${
-                health?.freezeDetected ? 'bg-amber-500' : 'bg-emerald-600'
-              }`}
-            />
-            <span className="whitespace-nowrap">{t('24/7 Live', 'مباشر 24/7')}</span>
-          </button>
-        </div>
-
-        {/* Desktop Navigation */}
-        <nav className="hidden md:flex items-center gap-4 text-xs font-semibold text-neutral-600 overflow-x-auto no-scrollbar">
-          {NAV_ITEMS.map((item) => {
-            const active = activePage === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setActivePage(item.id)}
-                className={`py-1.5 whitespace-nowrap shrink-0 border-b-2 transition-colors ${
-                  active
-                    ? 'text-black border-black'
-                    : 'border-transparent hover:text-black'
-                }`}
-              >
-                {lang === 'ar' ? item.labelAr : item.label}
-                {item.id === 'radar' && activeSignalsCount > 0 ? ` (${activeSignalsCount})` : ''}
-                {item.id === 'backtest-trades' && allBacktestSetups.length > 0 ? ` (${allBacktestSetups.length})` : ''}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* Right Controls: Language Switcher (عربي / EN), 10s Brief, Alert Mute/Inbox, Profile */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          <button
-            type="button"
-            onClick={() => setLang(lang === 'ar' ? 'en' : 'ar')}
-            aria-label="Switch Language"
-            title={t('Switch to Arabic (عربي)', 'التبديل إلى الإنجليزية (EN)')}
-            className="min-h-[36px] px-2.5 border border-neutral-300 bg-neutral-50 rounded-lg text-[11px] font-bold text-black hover:bg-neutral-100 flex items-center gap-1 whitespace-nowrap"
-          >
-            <Languages className="w-3.5 h-3.5" />
-            <span>{lang === 'ar' ? 'EN' : 'عربي'}</span>
-          </button>
-
-          <PWAInstallButton variant="header" />
-
-          <button
-            type="button"
-            onClick={() => setBriefOpen(true)}
-            className="min-h-[36px] px-2.5 border border-neutral-200 rounded-lg text-[11px] font-semibold text-black hover:bg-neutral-50 flex items-center gap-1 whitespace-nowrap"
-          >
-            <Radio className="w-3.5 h-3.5 text-emerald-700" />
-            <span className="hidden sm:inline">{t('10s Brief', 'ملخص 10ث')}</span>
-          </button>
-
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => {
-                setAlertsOpen((v) => !v);
-                if (!alertsOpen && unreadAlerts > 0) {
-                  setAlerts((prev) => prev.map((a) => ({ ...a, read: true })));
-                  void fetch('/api/alerts/read', { method: 'POST' });
-                }
-              }}
-              className="min-h-[36px] min-w-[36px] flex items-center justify-center border border-neutral-200 rounded-lg hover:bg-neutral-50 relative"
-              title={t('Alerts & Mute Toggle', 'التنبيهات وكتم الصوت')}
-            >
-              {alertsMuted ? <BellOff className="w-4 h-4 text-neutral-400" /> : <Bell className="w-4 h-4 text-black" />}
-              {unreadAlerts > 0 && !alertsMuted && (
-                <span className="absolute -top-1 -right-1 w-4 h-4 bg-red-600 text-white text-[9px] font-bold rounded-full flex items-center justify-center">
-                  {unreadAlerts}
-                </span>
-              )}
-            </button>
-
-            {alertsOpen && (
-              <div className={`absolute ${lang === 'ar' ? 'left-0' : 'right-0'} top-full mt-1.5 w-80 max-w-[calc(100vw-1.5rem)] bg-white border border-neutral-200 rounded-2xl shadow-2xl p-3 z-50`}>
-                <div className="flex items-center justify-between pb-2 border-b border-neutral-100">
-                  <span className="text-xs font-bold text-black">{t('Live Alerts', 'التنبيهات المباشرة')} ({alerts.length})</span>
-                  <button
-                    type="button"
-                    onClick={() => setAlertsMuted((v) => !v)}
-                    className="text-[11px] font-semibold text-neutral-600 hover:text-black"
-                  >
-                    {alertsMuted ? t('Unmute Sound', 'تشغيل الصوت') : t('Mute / Snooze', 'كتم الصوت')}
-                  </button>
-                </div>
-                <div className="max-h-64 overflow-y-auto divide-y divide-neutral-100">
-                  {alerts.length === 0 ? (
-                    <p className="text-xs text-neutral-500 py-4 text-center">{t('No alerts fired yet.', 'لا توجد تنبيهات بعد.')}</p>
-                  ) : (
-                    alerts.slice(0, 20).map((a) => (
-                      <button
-                        key={a.id}
-                        type="button"
-                        onClick={() => {
-                          setAlertsOpen(false);
-                          openAlertTradeCard({
-                            alert: a,
-                            signalId: a.signalId,
-                            tradeId: a.tradeId,
-                            symbol: a.symbol,
-                          });
-                        }}
-                        className="w-full text-start py-2 px-1.5 rounded-lg hover:bg-neutral-50 active:bg-neutral-100 transition-colors text-xs block"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-bold text-black truncate">{a.title}</span>
-                          <span className="text-[10px] font-semibold text-neutral-500 shrink-0">
-                            {t('Open Card', 'فتح الكارت')}
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-neutral-600 mt-0.5 line-clamp-2">{a.message}</div>
-                      </button>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setAuthModalOpen(true)}
-            className="min-h-[36px] px-2.5 bg-black text-white rounded-lg text-[11px] font-semibold hover:bg-neutral-800 flex items-center gap-1.5 whitespace-nowrap"
-          >
-            <User className="w-3.5 h-3.5" />
-            <span className="max-w-[90px] truncate">
-              {user && !user.isGuest ? user.displayName : t('Sign In', 'فتح حساب')}
-            </span>
-          </button>
-        </div>
-      </header>
-
-      {/* Main Content with Keep-Alive State Persistence across all 7 pages */}
-      <main className="flex-1 min-w-0 flex flex-col">
-        <div className={activePage === 'chart' ? 'flex-1 flex flex-col' : 'hidden'}>
-          <ChartPage
-            symbol={symbol}
-            onSelectSymbol={setSymbol}
-            timeframe={timeframe}
-            onSelectTimeframe={setTimeframe}
-            analysisMode={analysisMode}
-            onChangeAnalysisMode={setAnalysisMode}
-            activeSchools={activeSchools}
-            onToggleSchool={toggleSchool}
-            onSetSchools={setActiveSchools}
-            chartStyle={chartStyle}
-            onChangeChartStyle={setChartStyle}
-            splitLayout={splitLayout}
-            onChangeSplitLayout={setSplitLayout}
-            comparisonSymbol={comparisonSymbol}
-            onChangeComparisonSymbol={setComparisonSymbol}
-            candlesByKey={candlesByKey}
-            quotes={quotes}
-            signals={signals}
-            customIndicators={customIndicators}
-            onToggleIndicatorVisibility={(id) => void handleToggleIndicatorVisibility(id)}
-            drawings={drawings}
-            onAddDrawing={(d) => void handleAddDrawing(d)}
-            onUpdateDrawing={(d, persist) => void handleUpdateDrawing(d, persist)}
-            onDeleteDrawing={(id) => void handleDeleteDrawing(id)}
-            onToggleLockDrawing={(id) => void handleToggleLockDrawing(id)}
-            onToggleHideDrawing={(id) => void handleToggleHideDrawing(id)}
-            onUndoDrawing={handleUndo}
-            onRedoDrawing={handleRedo}
-            canUndo={drawings.length > 0}
-            canRedo={redoStack.length > 0}
-            activeTool={activeTool}
-            onSelectTool={setActiveTool}
-            magnetMode={magnetMode}
-            onCycleMagnet={() =>
-              setMagnetMode((m) => (m === 'off' ? 'weak' : m === 'weak' ? 'strong' : 'off'))
-            }
-            watchlist={watchlist}
-            onUpdateWatchlist={(items) => void handleUpdateWatchlist(items)}
-            templates={templates}
-            onSaveTemplate={(n) => void handleSaveTemplate(n)}
-            onApplyTemplate={handleApplyTemplate}
-            timezone={timezone}
-            onChangeTimezone={setTimezone}
-            user={user}
-            onJumpToDate={(ts) => void handleJumpToHistoricalDate(ts)}
-            onLoadMoreHistory={(sym, tf, beforeTime) => void handleLoadMoreHistory(sym, tf, beforeTime)}
-            isLoadingHistory={Boolean(historyLoadingByKey[`${symbol}:${timeframe}`])}
-            jumpTarget={jumpTarget}
-            onOpenCommandPalette={() => setCmdOpen(true)}
-            onExecuteOrder={handleExecuteOrder}
-            inspectedSignal={inspectedSignal}
-            onClearInspectedSignal={() => setInspectedSignal(null)}
-          />
-        </div>
-
-        <div className={activePage === 'radar' ? 'block' : 'hidden'}>
-          <RadarPage
-            signals={signals}
-            rejected={rejected}
-            quotes={quotes}
-            timezone={timezone}
-            onInspectSignal={handleInspectSignal}
-            onTriggerScan={async () => {
-              const res = await fetch('/api/signals/scan', { method: 'POST' });
-              if (res.ok) {
-                const d = await res.json();
-                setSignals(d.signals || []);
-                setRejected(d.rejected || []);
-                if (d.rootCauses) setRootCauseAnalytics(d.rootCauses);
-              }
-            }}
-          />
-        </div>
-
-        <div className={activePage === 'backtest' ? 'block' : 'hidden'}>
-          <BacktestPage
-            candlesByKey={candlesByKey}
-            activeSchools={activeSchools}
-            customIndicators={customIndicators}
-            timezone={timezone}
-            onFetchCandles={(s, tf) => fetchCandles(s, tf)}
-            totalSavedBacktestTrades={allBacktestSetups.length}
-            onSyncRunSetups={handleSyncBacktestRun}
-            onOpenBacktestTrades={() => setActivePage('backtest-trades')}
-            jumpRequest={btJumpRequest}
-          />
-        </div>
-
-        <div className={activePage === 'backtest-trades' ? 'block' : 'hidden'}>
-          <BacktestTradesPage
-            setups={allBacktestSetups}
-            timezone={timezone}
-            onJumpToSetup={handleJumpToBacktestSetup}
-            onOpenTradeCard={(setup) => setInspectedTradeModal({ kind: 'backtest', setup })}
-            onBackToReplay={() => setActivePage('backtest')}
-            onClearHistory={() => setBtSetupsByKey({})}
-          />
-        </div>
-
-        <div className={activePage === 'studio' ? 'block' : 'hidden'}>
-          <AIStudioPage
-            indicators={customIndicators}
-            onCreateOrUpdateIndicator={handleCreateOrUpdateIndicator}
-            onDeleteIndicator={handleDeleteIndicator}
-            onToggleVisibility={handleToggleIndicatorVisibility}
-            onSendToBacktest={() => setActivePage('backtest')}
-            authHeaders={authHeaders}
-            onIndicatorGenerated={(ind) =>
-              setCustomIndicators((prev) => [ind, ...prev.filter((x) => x.id !== ind.id)])
-            }
-          />
-        </div>
-
-        <div className={activePage === 'ai-log' ? 'block' : 'hidden'}>
-          <AILogPage
-            signals={signals}
-            rejected={rejected}
-            quotes={quotes}
-            riskUsdPerR={
-              user
-                ? Number(
-                    (
-                      (user.riskSettings.accountBalance * user.riskSettings.riskPerTradePct) /
-                      100
-                    ).toFixed(2)
-                  )
-                : 100
-            }
-            schoolWeights={schoolWeights}
-            rootCauseAnalytics={rootCauseAnalytics}
-            timezone={timezone}
-            onInspectSignal={handleInspectSignal}
-            onOpenTradeCard={(sig) => setInspectedTradeModal({ kind: 'signal', signal: sig })}
-          />
-        </div>
-
-        <div className={activePage === 'my-trades' ? 'block' : 'hidden'}>
-          <MyTradesPage
-            trades={trades}
-            quotes={quotes}
-            timezone={timezone}
-            onCloseTrade={handleCloseTrade}
-            onSaveReflection={handleSaveReflection}
-            onInspectSymbol={(s) => {
-              setSymbol(s);
-              setActivePage('chart');
-            }}
-            onOpenTradeCard={(trade) => setInspectedTradeModal({ kind: 'user', trade })}
-          />
-        </div>
-
-        <div className={activePage === 'settings' ? 'block' : 'hidden'}>
-          <SettingsPage
-            user={user}
-            health={health}
-            onOpenAuthModal={() => setAuthModalOpen(true)}
-            onSaveProfile={handleSaveProfile}
-            onSaveDefaultPreset={handleSaveDefaultPreset}
-            onEnablePushNotifications={handleEnablePush}
-          />
-        </div>
-      </main>
-
-      {/* Mobile Bottom Tab Bar (Thumb-Zone Ergonomics, <=15% sticky height) */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-30 h-14 bg-white/95 backdrop-blur-xs border-t border-neutral-200 grid grid-cols-8 items-center px-0.5">
-        {NAV_ITEMS.map((item) => {
-          const active = activePage === item.id;
-          const mobileTxt =
-            lang === 'ar'
-              ? item.mobileLabelAr ?? item.labelAr
-              : item.mobileLabel ?? item.label;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setActivePage(item.id)}
-              className={`h-full flex flex-col items-center justify-center gap-0.5 transition-colors ${
-                active ? 'text-black font-bold' : 'text-neutral-500'
-              }`}
-            >
-              {item.icon}
-              <span className="text-[8.5px] tracking-tight truncate max-w-full px-0.5">
-                {mobileTxt}
-              </span>
-            </button>
+          ws = new WebSocket(
+            `wss://stream.binance.com:9443/ws/${cleanSym}@kline_${binanceIntervalMap[timeframe] || '15m'}`
           );
-        })}
-      </nav>
-
-      {/* Modals */}
-      <AuthModal
-        open={authModalOpen}
-        onClose={() => setAuthModalOpen(false)}
-        user={user}
-        onAuthSuccess={(u, token) => {
-          setUser(u);
-          setAuthToken(token);
-          if (u.timezone) setTimezone(u.timezone);
-          if (u.language === 'ar' || u.language === 'en') {
-            setLangState(u.language);
-            try { localStorage.setItem('apex_lang', u.language); } catch {}
-          }
-          void loadWorkspaceData({ Authorization: `Bearer ${token}` });
-        }}
-        onLogout={async () => {
-          await fetch('/api/auth/logout', { method: 'POST', headers: authHeaders }).catch(() => {});
-          const guestRes = await fetch('/api/auth/guest', { method: 'POST' });
-          if (guestRes.ok) {
-            const d = await guestRes.json();
-            setUser(d.user);
-            setAuthToken(d.token);
-            await loadWorkspaceData({ Authorization: `Bearer ${d.token}` });
-          }
-          setAuthModalOpen(false);
-        }}
-      />
-
-      <CommandPalette
-        open={cmdOpen}
-        onClose={() => setCmdOpen(false)}
-        onSelectSymbol={(s) => {
-          setSymbol(s);
-          setActivePage('chart');
-        }}
-        onSelectTimeframe={(tf) => {
-          setTimeframe(tf);
-          setActivePage('chart');
-        }}
-        onToggleSchool={toggleSchool}
-        onSelectTool={(t) => {
-          setActiveTool(t);
-          setActivePage('chart');
-        }}
-        onSelectPage={setActivePage}
-      />
-
-      {/* Quick 10-Second Daily Brief Modal */}
-      {briefOpen && (
-        <div className="fixed inset-0 z-50 bg-black/35 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white border border-neutral-200 rounded-2xl w-full max-w-md p-5 space-y-3 shadow-2xl">
-            <div className="flex items-center justify-between pb-2 border-b border-neutral-100">
-              <h3 className="text-sm font-bold text-black">{t('10-Second Daily Market Brief', 'الملخص اليومي السريع في 10 ثوانٍ')}</h3>
-              <button
-                type="button"
-                onClick={() => setBriefOpen(false)}
-                className="p-1.5 rounded-lg hover:bg-neutral-100"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="text-xs text-neutral-800 space-y-2 font-mono-tabular">
-              <div dir="ltr" className={lang === 'ar' ? 'text-right' : 'text-left'}>
-                XAUUSD: <strong>{quotes['XAUUSD']?.mid.toFixed(2) ?? '—'}</strong> · BTCUSDT:{' '}
-                <strong>{quotes['BTCUSDT']?.mid.toFixed(2) ?? '—'}</strong> · DXY:{' '}
-                <strong>{quotes['DXY']?.mid.toFixed(3) ?? '—'}</strong>
-              </div>
-              <div className="font-sans">
-                {t('Confirmed Live Signals', 'الإشارات المؤكدة المباشرة')}: <strong>{activeSignalsCount}</strong> · {t('Forming Watchlist', 'قيد التكوّن')}:{' '}
-                <strong>{signals.filter((s) => s.status === 'Watchlist').length}</strong>
-              </div>
-              {signals[0] && (
-                <div dir={lang === 'ar' ? 'rtl' : 'ltr'} className="p-3 bg-neutral-50 border border-neutral-200 rounded-xl font-sans leading-relaxed whitespace-pre-line">
-                  {lang === 'ar'
-                    ? signals[0].rationaleAr
-                    : signals[0].rationaleEn ||
-                      `${signals[0].symbol} ${signals[0].direction} (${signals[0].recommendedTimeframe.toUpperCase()}): ${signals[0].regimeMatch} · Entry ${signals[0].entryPrice} · SL ${signals[0].currentSl} · TP1 ${signals[0].tp1}`}
-                </div>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                setBriefOpen(false);
-                setActivePage('radar');
-              }}
-              className="w-full min-h-[40px] bg-black text-white rounded-xl text-xs font-semibold"
-            >
-              {t('Open Full Radar', 'فتح الرادار الكامل')}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Interactive Live Alert Toast Banner (Tap to open Trade Card) */}
-      {activeToastAlert && (
-        <div
-          className={`fixed top-15 z-40 w-[calc(100%-1.5rem)] max-w-sm ${
-            lang === 'ar' ? 'left-3 sm:left-5' : 'right-3 sm:right-5'
-          }`}
-        >
-          <div
-            onClick={() => {
-              const target = activeToastAlert;
-              setActiveToastAlert(null);
-              openAlertTradeCard({
-                alert: target,
-                signalId: target.signalId,
-                tradeId: target.tradeId,
-                symbol: target.symbol,
+          ws.onmessage = (evt) => {
+            try {
+              const msg = JSON.parse(evt.data) as {
+                k?: { t: number; o: string; h: string; l: string; c: string; v: string };
+              };
+              const k = msg.k;
+              if (!k) return;
+              const liveCandle: Candle = {
+                time: Math.floor(k.t / 1000),
+                open: Number(k.o),
+                high: Number(k.h),
+                low: Number(k.l),
+                close: Number(k.c),
+                volume: Number(k.v),
+              };
+              setCandlesByKey((prev) => {
+                const existing = prev[key] || [];
+                if (existing.length === 0) return { ...prev, [key]: [liveCandle] };
+                const next = [...existing];
+                const lastIdx = next.length - 1;
+                if (next[lastIdx].time === liveCandle.time) {
+                  next[lastIdx] = liveCandle;
+                } else if (liveCandle.time > next[lastIdx].time) {
+                  next.push(liveCandle);
+                }
+                return { ...prev, [key]: next };
               });
-            }}
-            className="bg-black text-white rounded-2xl shadow-2xl border border-neutral-800 p-3 flex items-start gap-2.5 cursor-pointer hover:bg-neutral-900 active:scale-[0.99] transition-all"
-          >
-            <Bell className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-            <div className="min-w-0 flex-1">
-              <div className="text-xs font-bold truncate">{activeToastAlert.title}</div>
-              <div className="text-[11px] text-neutral-300 line-clamp-2 mt-0.5">
-                {activeToastAlert.message}
-              </div>
-              <div className="text-[10px] font-semibold text-emerald-400 mt-1">
-                {t('Tap to open Trade Card & Chart →', 'اضغط لفتح كارت الصفقة والشارت ←')}
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setActiveToastAlert(null);
-              }}
-              aria-label={t('Dismiss alert', 'إخفاء التنبيه')}
-              className="p-1 text-neutral-400 hover:text-white shrink-0"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Trade Card & Details Modal */}
-      <TradeDetailsModal
-        payload={inspectedTradeModal}
-        quotes={quotes}
-        timezone={timezone}
-        riskUsdPerR={
-          user
-            ? Number(
-                (
-                  (user.riskSettings.accountBalance * user.riskSettings.riskPerTradePct) /
-                  100
-                ).toFixed(2)
-              )
-            : 100
+            } catch {
+              // ignore malformed message
+            }
+          };
+          ws.onclose = () => {
+            if (!closed) reconnectTimer = setTimeout(connectBinance, 3000);
+          };
+        } catch {
+          if (!closed) reconnectTimer = setTimeout(connectBinance, 3000);
         }
-        onClose={() => setInspectedTradeModal(null)}
-        onJumpToChart={handleJumpFromTradeModal}
-      />
+      };
 
-      <OfflineIndicator />
-    </div>
-    </I18nContext.Provider>
-  );
-}
+      connectBinance();
+      return () => {
+        closed = true;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        if (ws) ws.close();
+      };
+    }
+
+    const oandaKey = import.meta.env.VITE_OANDA_API_KEY as string | undefined;
+    const oandaEnv = (
+      (import.meta.env.VITE_OANDA_ENV as string | undefined) || 'practice'
+    ).toLowerCase();
+    const oandaBaseUrl =
+      oandaEnv === 'live' ? 'https://api-fxtrade.oanda.com' : 'https://api-fxpractice.oanda.com';
+
+    const toOandaInstrument = (rawSym: string): string => {
+      const clean = rawSym.replace(/[^A-Za-z0-9_]/g, '').toUpperCase();
+      const map: Record<string, string> = {
+        USOIL: 'WTICO_USD',
+        WTI: 'WTICO_USD',
+        WTICOUSD: 'WTICO_USD',
+        UKOIL: 'BCO_USD',
+        BRENT: 'BCO_USD',
+        BCOUSD: 'BCO_USD',
+        NATGAS: 'NATGAS_USD',
+        NATGASUSD: 'NATGAS_USD',
+        XAUUSD: 'XAU_USD',
+        XAGUSD: 'XAG_USD',
+        XPTUSD: 'XPT_USD',
+        XPDUSD: 'XPD_USD',
+        XCUUSD: 'XCU_USD',
+        US30: 'US30_USD',
+        NAS100: 'NAS100_USD',
+        SPX500: 'SPX500_USD',
+        GER40: 'DE30_EUR',
+        UK100: 'UK100_GBP',
+      };
+      if (map[clean]) return map[clean];
+      if (clean.includes('_')) return clean;
+      if (clean.length === 6) return `${clean.slice(0, 3)}_${clean.slice(3, 6)}`;
+      return clean;
+    };
+
+    const instrument = toOandaInstrument(symbol);
+    const decimals = symbol === 'XAUUSD' ? 2 : symbol.includes('JPY') ? 3 : 5;
+
+    const pollOandaPrice = async () => {
+      if (!oandaKey) return;
+      try {
+        const res = await fetch(
+          `${oandaBaseUrl}/v3/pricing?instruments=${encodeURIComponent(instrument)}`,
+          {
+            headers: {
+              Authorization: `Bearer ${oandaKey}`,
+              'Content-Type': 'application/json',
+            },
+          }
+        );
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          prices?: Array<{ bids?: Array<{ price: string }>; asks?: Array<{ price: string }> }>;
+        };
+        const p = data.prices?.[0];
+        if (!p) return;
+        const bid = Number(p.bids?.[0]?.price ?? p.asks?.[0]?.price);
+        const ask = Number(p.asks?.[0]?.price ?? p.bids?.[0]?.price);
+        if (!Number.isFinite(bid) || !Number.isFinite(ask)) return;
+        const mid = Number(((bid + ask) / 2).toFixed(decimals));
+        const nowBarTime = Math.floor(Math.floor(Date.now() / 1000) / tfSec) * tfSec;
+
+        setCandlesByKey((prev) => {
+          const existing = prev[key];
+          if (!existing || existing.length === 0) return prev;
+          const next = [...existing];
+          const last = next[next.length - 1];
+          if (last.time === nowBarTime) {
+            next[next.length - 1] = {
+              ...last,
+              close: mid,
+              high: Number(Math.max(last.high, mid).toFixed(decimals)),
+              low: Number(Math.min(last.low, mid).toFixed(decimals)),
+            };
+          } else if (nowBarTime > last.time) {
+            next.push({
+              time: nowBarTime,
+              open: last.close,
+              high: Number(Math.max(last.close, mid).toFixed(decimals)),
+              low: Number(Math.min(last.close, mid).toFixed(decimals)),
+              close: mid,
+              volume: 0,
+            });
+          }
+          return { ...prev, [key]: next };
+        });
+
+        setQuotes((qPrev) => ({
+          ...qPrev,
+          [symbol]: {
+            ...(qPrev[symbol] || { symbol, change24h: 0, changePct24h: 0 }),
+            symbol,
+            bid,
+            ask,
+            mid,
+            updatedAt: Date.now(),
+          } as LiveQuote,
+        }));
+      } catch {
+        // ignore transient network error
+      }
+    };
+
+    void pollOandaPrice();
+    const pollTimer = setInterval(pollOandaPrice, 2000);
+    return () => clearInterval(pollTimer);
+  }, [symbol, timeframe]);
